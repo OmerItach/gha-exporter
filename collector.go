@@ -58,6 +58,28 @@ var (
 		},
 		[]string{"repo", "ref", "event_type", "workflow", "job", "step", "conclusion"},
 	)
+	workflowRunStatusVec = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "gha_workflow_run_status",
+			Help: "Status of the last workflow run (1 for success, 0 for failure)",
+		},
+		[]string{"repo", "ref", "event_type", "workflow"},
+	)
+	workflowLastRunDurationVec = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "gha_workflow_last_run_duration_seconds",
+			Help: "Duration of the last completed workflow run in seconds",
+		},
+		[]string{"repo", "ref", "event_type", "workflow"},
+	)
+	workflowLastRunIDVec = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "gha_workflow_last_run_id",
+			Help: "ID of the last completed workflow run",
+		},
+		[]string{"repo", "ref", "event_type", "workflow"},
+	)
+
 )
 
 type Collector struct {
@@ -80,6 +102,10 @@ func NewCollector(cfg *CLI) *Collector {
 	prometheus.MustRegister(workflowRunCountVec)
 	prometheus.MustRegister(jobRunCountVec)
 	prometheus.MustRegister(stepRunCountVec)
+	prometheus.MustRegister(workflowRunStatusVec)
+	prometheus.MustRegister(workflowLastRunDurationVec)
+	prometheus.MustRegister(workflowLastRunIDVec)
+
 
 	return &Collector{
 		cfg:              cfg,
@@ -93,12 +119,58 @@ func (c *Collector) Run(ctx context.Context) {
 	defer func() { log.Print("Collector finished: ", ctx.Err()) }()
 
 	for ; ctx.Err() == nil; time.Sleep(c.cfg.Sleep) {
-		for _, repo := range c.cfg.Repos {
+		repos := c.cfg.Repos
+		if len(repos) == 0 {
+			var err error
+			repos, err = c.discoverRepos(ctx)
+			if err != nil {
+				log.Printf("Failed to discover repos: %v", err)
+				continue
+			}
+		}
+
+		for _, repo := range repos {
 			if err := c.collectRepo(ctx, repo); err != nil {
 				log.Print(err)
 			}
 		}
 	}
+}
+
+func (c *Collector) discoverRepos(ctx context.Context) ([]string, error) {
+	// Recreate client on demand
+	if c.client == nil {
+		client, err := newGHClient(c.cfg.Owner, c.cfg.AppID, []byte(c.cfg.AppKey))
+		if err != nil {
+			return nil, trace.Wrap(err, "failed to create client for discovery")
+		}
+		c.client = client
+	}
+
+	var allRepos []string
+	opts := &github.ListOptions{PerPage: 100}
+
+	// We need to get the installation ID first, which newGHClient already does but doesn't expose easily.
+	// However, newGHClient sets c.client which is an authenticated client for the installation.
+	// For GitHub Apps, we can list repositories for the current installation.
+	for {
+		repos, resp, err := c.client.Apps.ListRepos(ctx, opts)
+		if err != nil {
+			return nil, trace.Wrap(err, "failed to list app repositories")
+		}
+		for _, r := range repos.Repositories {
+			// Ensure it belongs to the owner we care about
+			if strings.EqualFold(r.GetOwner().GetLogin(), c.cfg.Owner) {
+				allRepos = append(allRepos, r.GetName())
+			}
+		}
+		if resp.NextPage == 0 {
+			break
+		}
+		opts.Page = resp.NextPage
+	}
+
+	return allRepos, nil
 }
 
 func (c *Collector) collectRepo(ctx context.Context, repo string) error {
@@ -132,24 +204,29 @@ func (c *Collector) collectRepo(ctx context.Context, repo string) error {
 	}
 
 	actions := c.client.Actions
-	newCutoff := time.Now().UTC()
+	var allRuns []*github.WorkflowRun
 	for {
 		runs, response, err := actions.ListRepositoryWorkflowRuns(ctx, c.cfg.Owner, repo, opts)
 		if err != nil {
 			return trace.Wrap(err, "failed to list workflow runs")
 		}
-
-		for _, run := range runs.WorkflowRuns {
-			newCutoff, err = c.collectRun(ctx, repo, run, newCutoff, ignoreCompleted)
-			if err != nil {
-				return trace.Wrap(err, "failed to collect workflow runs")
-			}
-		}
+		allRuns = append(allRuns, runs.WorkflowRuns...)
 
 		opts.Page = response.NextPage
 		if opts.Page == 0 {
 			break
 		}
+	}
+
+	newCutoff := time.Now().UTC()
+	// Process runs from oldest to newest (GitHub API returns newest first)
+	for i := len(allRuns) - 1; i >= 0; i-- {
+		run := allRuns[i]
+		newRunCutoff, err := c.collectRun(ctx, repo, run, newCutoff, ignoreCompleted)
+		if err != nil {
+			return trace.Wrap(err, "failed to collect workflow runs")
+		}
+		newCutoff = newRunCutoff
 	}
 	c.oldestIncomplete[repo] = newCutoff
 	return nil
@@ -195,7 +272,7 @@ func (c *Collector) collectJobs(ctx context.Context, repo string, run *github.Wo
 			return trace.Wrap(err, "failed to list workflow run jobs")
 		}
 
-		countJobs(run, jobs.Jobs)
+		c.countJobs(repo, run, jobs.Jobs)
 
 		opts.Page = response.NextPage
 		if opts.Page == 0 {
@@ -205,20 +282,22 @@ func (c *Collector) collectJobs(ctx context.Context, repo string, run *github.Wo
 	return nil
 }
 
-func countJobs(run *github.WorkflowRun, jobs []*github.WorkflowJob) {
+func (c *Collector) countJobs(repoName string, run *github.WorkflowRun, jobs []*github.WorkflowJob) {
 	workflowName := path.Base(run.GetPath())
 	workflowName = strings.TrimSuffix(workflowName, path.Ext(workflowName))
-	repo := run.GetRepository().GetName()
+	repo := c.cfg.Owner + "/" + repoName
 	ref := makeRef(run)
 	eventType := run.GetEvent()
 
 	var workflowRunTime time.Duration
+
 	for _, job := range jobs {
 		var jobRunTime time.Duration
 		for _, step := range job.Steps {
 			stepRunCountVec.WithLabelValues(
 				repo, ref, eventType, workflowName, job.GetName(), step.GetName(), step.GetConclusion(),
 			).Add(1)
+
 
 			if step.GetConclusion() != "success" {
 				continue
@@ -235,6 +314,7 @@ func countJobs(run *github.WorkflowRun, jobs []*github.WorkflowJob) {
 		jobRunCountVec.WithLabelValues(
 			repo, ref, eventType, workflowName, job.GetName(), job.GetConclusion(),
 		).Add(1)
+
 		if job.GetConclusion() != "success" {
 			continue
 		}
@@ -253,13 +333,23 @@ func countJobs(run *github.WorkflowRun, jobs []*github.WorkflowJob) {
 	}
 
 	workflowRunCountVec.WithLabelValues(repo, ref, eventType, workflowName, run.GetConclusion()).Add(1)
+	workflowLastRunIDVec.WithLabelValues(repo, ref, eventType, workflowName).Set(float64(run.GetID()))
+
+
+	statusValue := 0.0
+	if run.GetConclusion() == "success" {
+		statusValue = 1.0
+	}
+	workflowRunStatusVec.WithLabelValues(repo, ref, eventType, workflowName).Set(statusValue)
 
 	if run.GetConclusion() != "success" {
 		return
 	}
 
 	workflowRunnerSecondsVec.WithLabelValues(repo, ref, eventType, workflowName).Add(workflowRunTime.Seconds())
+	workflowLastRunDurationVec.WithLabelValues(repo, ref, eventType, workflowName).Set(workflowRunTime.Seconds())
 	workflowElapsedSecondsVec.WithLabelValues(repo, ref, eventType, workflowName).Add(run.GetUpdatedAt().Sub(run.GetCreatedAt().Time).Seconds())
+
 }
 
 func makeRef(run *github.WorkflowRun) string {
