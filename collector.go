@@ -343,6 +343,12 @@ func (c *Collector) countJobs(repoName string, run *github.WorkflowRun, jobs []*
 	workflowRunStatusVec.WithLabelValues(repo, ref, eventType, workflowName).Set(statusValue)
 
 	if run.GetConclusion() != "success" {
+		if run.UpdatedAt != nil && run.CreatedAt != nil {
+			elapsed := run.GetUpdatedAt().Sub(run.GetCreatedAt().Time)
+			workflowLastRunDurationVec.WithLabelValues(
+				repo, ref, eventType, workflowName,
+			).Set(elapsed.Seconds())
+		}
 		return
 	}
 
