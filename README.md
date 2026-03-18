@@ -11,7 +11,9 @@ Flags:
       --app-id=INT-64        GitHub App ID of application to authenticate as ($GHA_APP_ID)
       --app-key=STRING       Private key of GitHub App for the App ID ($GHA_APP_KEY)
       --owner=STRING         GitHub owner of repositories to monitor ($GHA_OWNER)
-      --repos=REPOS,...      Repositories to monitor (must be owned by --owner)
+      --repos=REPOS,...      Repositories to monitor (must be owned by --owner).
+                             If omitted, all repositories accessible to the GitHub App
+                             are automatically discovered
       --sleep=1m             Sleep time (duration string)between polls of GitHub Actions
       --initial-window=2h    Initial time to look back for runs
       --backfill             Backfill completed runs from initial window

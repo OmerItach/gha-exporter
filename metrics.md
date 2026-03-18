@@ -92,3 +92,34 @@ A `counter` of the number of runs of a workflow by conclusion.
 
 Same as `gha_job_run_count` but without the `job` label.
 
+
+## `gha_workflow_run_status`
+
+A `gauge` of the status of the last workflow run. Value is `1` for success
+and `0` for failure.
+
+### Labels
+
+Same as `gha_workflow_run_count` but without the `job` and `conclusion` labels.
+
+
+## `gha_workflow_last_run_duration_seconds`
+
+A `gauge` of the elapsed duration of the last completed workflow run in seconds.
+This is the "wall clock time" from when the run was created until it completed,
+regardless of whether it succeeded or failed.
+
+### Labels
+
+Same as `gha_workflow_run_status`.
+
+
+## `gha_workflow_last_run_id`
+
+A `gauge` containing the ID of the last completed workflow run. Useful for
+correlating with GitHub Actions UI or API.
+
+### Labels
+
+Same as `gha_workflow_run_status`.
+
