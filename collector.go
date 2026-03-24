@@ -2,8 +2,11 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"path"
 	"strings"
 	"time"
@@ -85,13 +88,18 @@ var (
 type Collector struct {
 	cfg    *CLI
 	client *github.Client
-	// seenRuns tracks which completed workflows runs we've seen so we don't count
-	// them again.
-	seenRuns map[int64]bool
+	// seenRuns tracks which completed workflow run IDs we've counted this session,
+	// keyed by short repo name. Evicted periodically to prevent unbounded growth.
+	seenRuns map[string]map[int64]bool
 	// oldestIncomplete tracks per-repo the earliest start time of a workflow run that we've
 	// seen that was not completed. This becomes the cutoff for querying github
 	// each collect loop.
 	oldestIncomplete map[string]time.Time
+	// highWaterMark[owner/repo] = max run ID known to be persisted in Prometheus.
+	// Populated on startup by querying the Prometheus HTTP API. Any completed run
+	// with ID <= this value has already been counted and must be skipped, even after
+	// a pod restart when seenRuns is empty.
+	highWaterMark map[string]int64
 }
 
 func NewCollector(cfg *CLI) *Collector {
@@ -106,17 +114,130 @@ func NewCollector(cfg *CLI) *Collector {
 	prometheus.MustRegister(workflowLastRunDurationVec)
 	prometheus.MustRegister(workflowLastRunIDVec)
 
-
 	return &Collector{
 		cfg:              cfg,
-		seenRuns:         make(map[int64]bool),
+		seenRuns:         make(map[string]map[int64]bool),
 		oldestIncomplete: make(map[string]time.Time),
+		highWaterMark:    make(map[string]int64),
+	}
+}
+
+// loadStateFromPrometheus queries the deployed Prometheus instance for the
+// maximum workflow run ID it has ever scraped per repo. This is used to seed
+// highWaterMark so that runs already counted before a pod restart are not
+// double-counted after the in-memory seenRuns map is wiped.
+func (c *Collector) loadStateFromPrometheus(ctx context.Context) {
+	if c.cfg.PrometheusURL == "" {
+		log.Print("GHA_PROMETHEUS_URL not set — starting with empty state. Runs in initialWindow may be double-counted after pod restarts.")
+		return
+	}
+
+	query := `max by (repo) (gha_workflow_last_run_id)`
+	apiURL := strings.TrimSuffix(c.cfg.PrometheusURL, "/") + "/api/v1/query?query=" + url.QueryEscape(query)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
+	if err != nil {
+		log.Printf("Warning: failed to build Prometheus state query: %v", err)
+		return
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		log.Printf("Warning: failed to query Prometheus for initial state: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		Status string `json:"status"`
+		Data   struct {
+			Result []struct {
+				Metric map[string]string  `json:"metric"`
+				Value  [2]json.RawMessage `json:"value"`
+			} `json:"result"`
+		} `json:"data"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		log.Printf("Warning: failed to decode Prometheus response: %v", err)
+		return
+	}
+	if result.Status != "success" {
+		log.Printf("Warning: Prometheus returned non-success status: %s", result.Status)
+		return
+	}
+
+	for _, r := range result.Data.Result {
+		repo := r.Metric["repo"]
+		if repo == "" {
+			continue
+		}
+		var valStr string
+		if err := json.Unmarshal(r.Value[1], &valStr); err != nil {
+			continue
+		}
+		var runID int64
+		if _, err := fmt.Sscanf(valStr, "%d", &runID); err != nil || runID <= 0 {
+			continue
+		}
+		c.highWaterMark[repo] = runID
+		log.Printf("Restored from Prometheus: repo=%s lastRunID=%d", repo, runID)
+	}
+	log.Printf("Loaded %d repo states from Prometheus", len(c.highWaterMark))
+}
+
+// isAlreadySeen returns true if this run has already been counted, either
+// in the current session (seenRuns) or before a pod restart (highWaterMark).
+func (c *Collector) isAlreadySeen(repo string, runID int64) bool {
+	if c.seenRuns[repo][runID] {
+		return true
+	}
+	fullRepo := c.cfg.Owner + "/" + repo
+	hwm, ok := c.highWaterMark[fullRepo]
+	return ok && runID <= hwm
+}
+
+// markSeen records a run ID as counted and updates the per-repo high water mark.
+func (c *Collector) markSeen(repo string, runID int64) {
+	if c.seenRuns[repo] == nil {
+		c.seenRuns[repo] = make(map[int64]bool)
+	}
+	c.seenRuns[repo][runID] = true
+	// Keep the in-process high water mark growing so eviction works correctly.
+	fullRepo := c.cfg.Owner + "/" + repo
+	if runID > c.highWaterMark[fullRepo] {
+		c.highWaterMark[fullRepo] = runID
+	}
+}
+
+// evictOldSeenRuns removes entries from seenRuns[repo] whose IDs are strictly
+// less than the current high water mark. Those runs are guaranteed to be in
+// Prometheus already (or skipped), so keeping them in memory is wasteful.
+func (c *Collector) evictOldSeenRuns(repo string) {
+	fullRepo := c.cfg.Owner + "/" + repo
+	hwm := c.highWaterMark[fullRepo]
+	if hwm == 0 {
+		return
+	}
+	evicted := 0
+	for id := range c.seenRuns[repo] {
+		if id < hwm {
+			delete(c.seenRuns[repo], id)
+			evicted++
+		}
+	}
+	if evicted > 0 {
+		log.Printf("Evicted %d old seenRuns entries for repo %s (hwm=%d)", evicted, repo, hwm)
 	}
 }
 
 func (c *Collector) Run(ctx context.Context) {
 	log.Print("Collector started")
 	defer func() { log.Print("Collector finished: ", ctx.Err()) }()
+
+	// Restore high water marks from Prometheus on startup so runs already
+	// counted before this pod restarted are not double-counted.
+	c.loadStateFromPrometheus(ctx)
 
 	for ; ctx.Err() == nil; time.Sleep(c.cfg.Sleep) {
 		repos := c.cfg.Repos
@@ -229,6 +350,9 @@ func (c *Collector) collectRepo(ctx context.Context, repo string) error {
 		newCutoff = newRunCutoff
 	}
 	c.oldestIncomplete[repo] = newCutoff
+	// Evict seenRuns entries whose IDs are below the high water mark.
+	// This prevents the map from growing without bound over long uptime.
+	c.evictOldSeenRuns(repo)
 	return nil
 }
 
@@ -246,14 +370,14 @@ func (c *Collector) collectRun(ctx context.Context, repo string, run *github.Wor
 		default:
 			log.Printf("open: %s/%d: %s", repo, run.GetID(), run.GetName())
 		}
-	case c.seenRuns[run.GetID()]:
+	case c.isAlreadySeen(repo, run.GetID()):
 		log.Printf("seen: %s/%d: %s", repo, run.GetID(), run.GetName())
 	default:
 		if !ignoreCompleted {
 			err = c.collectJobs(ctx, repo, run)
 		}
 		if err == nil {
-			c.seenRuns[run.GetID()] = true
+			c.markSeen(repo, run.GetID())
 			log.Printf("done: %s/%d: %s\n", repo, run.GetID(), run.GetName())
 		}
 	}
@@ -353,9 +477,11 @@ func (c *Collector) countJobs(repoName string, run *github.WorkflowRun, jobs []*
 	}
 
 	workflowRunnerSecondsVec.WithLabelValues(repo, ref, eventType, workflowName).Add(workflowRunTime.Seconds())
-	workflowLastRunDurationVec.WithLabelValues(repo, ref, eventType, workflowName).Set(workflowRunTime.Seconds())
-	workflowElapsedSecondsVec.WithLabelValues(repo, ref, eventType, workflowName).Add(run.GetUpdatedAt().Sub(run.GetCreatedAt().Time).Seconds())
-
+	if run.UpdatedAt != nil && run.CreatedAt != nil {
+		elapsed := run.GetUpdatedAt().Sub(run.GetCreatedAt().Time)
+		workflowLastRunDurationVec.WithLabelValues(repo, ref, eventType, workflowName).Set(elapsed.Seconds())
+		workflowElapsedSecondsVec.WithLabelValues(repo, ref, eventType, workflowName).Add(elapsed.Seconds())
+	}
 }
 
 func makeRef(run *github.WorkflowRun) string {

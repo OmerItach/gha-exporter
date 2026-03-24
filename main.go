@@ -21,6 +21,7 @@ type CLI struct {
 	InitialWindow time.Duration `default:"2h" help:"Initial time to look back for runs"`
 	Backfill      bool          `default:"false" help:"Backfill completed runs from initial window"`
 	Port          int           `default:"10013" env:"GHA_PORT" help:"Port to listen on"`
+	PrometheusURL string        `env:"GHA_PROMETHEUS_URL" help:"Prometheus HTTP API base URL (e.g. http://prometheus:9090). Used to restore state on startup and avoid double-counting after pod restarts."`
 }
 
 func main() {
