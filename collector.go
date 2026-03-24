@@ -370,15 +370,22 @@ func (c *Collector) collectRun(ctx context.Context, repo string, run *github.Wor
 		default:
 			log.Printf("open: %s/%d: %s", repo, run.GetID(), run.GetName())
 		}
-	case c.isAlreadySeen(repo, run.GetID()):
-		log.Printf("seen: %s/%d: %s", repo, run.GetID(), run.GetName())
 	default:
-		if !ignoreCompleted {
-			err = c.collectJobs(ctx, repo, run)
-		}
-		if err == nil {
-			c.markSeen(repo, run.GetID())
-			log.Printf("done: %s/%d: %s\n", repo, run.GetID(), run.GetName())
+		// Always update gauges for completed runs, even if already seen or ignoring
+		// for counters. This ensures Gauges (which are in-memory only) are restored
+		// after a restart from the newest runs in the list.
+		c.updateGauges(repo, run)
+
+		if c.isAlreadySeen(repo, run.GetID()) {
+			log.Printf("seen: %s/%d: %s", repo, run.GetID(), run.GetName())
+		} else {
+			if !ignoreCompleted {
+				err = c.collectJobs(ctx, repo, run)
+			}
+			if err == nil {
+				c.markSeen(repo, run.GetID())
+				log.Printf("done: %s/%d: %s\n", repo, run.GetID(), run.GetName())
+			}
 		}
 	}
 
@@ -457,8 +464,28 @@ func (c *Collector) countJobs(repoName string, run *github.WorkflowRun, jobs []*
 	}
 
 	workflowRunCountVec.WithLabelValues(repo, ref, eventType, workflowName, run.GetConclusion()).Add(1)
-	workflowLastRunIDVec.WithLabelValues(repo, ref, eventType, workflowName).Set(float64(run.GetID()))
 
+	if run.GetConclusion() == "success" {
+		workflowRunnerSecondsVec.WithLabelValues(repo, ref, eventType, workflowName).Add(workflowRunTime.Seconds())
+		if run.UpdatedAt != nil && run.CreatedAt != nil {
+			elapsed := run.GetUpdatedAt().Sub(run.GetCreatedAt().Time)
+			workflowElapsedSecondsVec.WithLabelValues(repo, ref, eventType, workflowName).Add(elapsed.Seconds())
+		}
+	}
+}
+
+func (c *Collector) updateGauges(repoName string, run *github.WorkflowRun) {
+	if run.GetConclusion() == "" {
+		return
+	}
+
+	workflowName := path.Base(run.GetPath())
+	workflowName = strings.TrimSuffix(workflowName, path.Ext(workflowName))
+	repo := c.cfg.Owner + "/" + repoName
+	ref := makeRef(run)
+	eventType := run.GetEvent()
+
+	workflowLastRunIDVec.WithLabelValues(repo, ref, eventType, workflowName).Set(float64(run.GetID()))
 
 	statusValue := 0.0
 	if run.GetConclusion() == "success" {
@@ -466,21 +493,9 @@ func (c *Collector) countJobs(repoName string, run *github.WorkflowRun, jobs []*
 	}
 	workflowRunStatusVec.WithLabelValues(repo, ref, eventType, workflowName).Set(statusValue)
 
-	if run.GetConclusion() != "success" {
-		if run.UpdatedAt != nil && run.CreatedAt != nil {
-			elapsed := run.GetUpdatedAt().Sub(run.GetCreatedAt().Time)
-			workflowLastRunDurationVec.WithLabelValues(
-				repo, ref, eventType, workflowName,
-			).Set(elapsed.Seconds())
-		}
-		return
-	}
-
-	workflowRunnerSecondsVec.WithLabelValues(repo, ref, eventType, workflowName).Add(workflowRunTime.Seconds())
 	if run.UpdatedAt != nil && run.CreatedAt != nil {
 		elapsed := run.GetUpdatedAt().Sub(run.GetCreatedAt().Time)
 		workflowLastRunDurationVec.WithLabelValues(repo, ref, eventType, workflowName).Set(elapsed.Seconds())
-		workflowElapsedSecondsVec.WithLabelValues(repo, ref, eventType, workflowName).Add(elapsed.Seconds())
 	}
 }
 
